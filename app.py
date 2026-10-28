@@ -6,7 +6,7 @@ import uuid
 import boto3
 from flask import Flask, jsonify, request
 
-VERSION = "1.0"
+VERSION = "2.0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("quickbite")
@@ -18,6 +18,7 @@ MENU = {
     "paneer-wrap": {"name": "Paneer Wrap", "price": 150},
     "masala-fries": {"name": "Masala Fries", "price": 90},
     "cold-coffee": {"name": "Cold Coffee", "price": 80},
+"mango-lassi": {"name": "Mango Lassi", "price": 70},
 }
 
 
