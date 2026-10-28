@@ -1,0 +1,85 @@
+name: QuickBite CI/CD
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_DEFAULT_REGION: ap-south-1
+  ECR_REPO: quickbite-app
+  CLUSTER: quickbite-cluster
+  SERVICE: quickbite-service
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run unit tests
+        run: pytest -v
+
+  build:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+      - name: Build and push to Amazon ECR
+        run: |
+          set -e
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY=$ACCOUNT.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          aws ecr get-login-password | docker login --username AWS --password-stdin $REGISTRY
+          IMAGE=$REGISTRY/$ECR_REPO
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest .
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+      - name: Show vulnerability scan result
+        run: |
+          aws ecr wait image-scan-complete --repository-name $ECR_REPO --image-id imageTag=${{ github.sha }} || true
+          aws ecr describe-image-scan-findings --repository-name $ECR_REPO --image-id imageTag=${{ github.sha }} --query "imageScanFindings.findingSeverityCounts" || true
+
+  deploy:
+    name: Deploy to ECS Fargate
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Roll out the new image and verify it
+        run: |
+          set -e
+          DESIRED=$(aws ecs describe-services --cluster $CLUSTER --services $SERVICE --query "services[0].desiredCount" --output text)
+          if [ "$DESIRED" = "0" ]; then
+            echo "Service is scaled to 0: image is in ECR, rollout skipped."
+            exit 0
+          fi
+          aws ecs update-service --cluster $CLUSTER --service $SERVICE --force-new-deployment --query "service.deployments[0].rolloutState" --output text
+          aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
+          TASK=$(aws ecs list-tasks --cluster $CLUSTER --service-name $SERVICE --query "taskArns[0]" --output text)
+          ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+          echo "New task is at $IP"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS http://$IP:8080/health; then
+              echo
+              curl -fsS http://$IP:8080/
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Smoke test failed"
+          exit 1
